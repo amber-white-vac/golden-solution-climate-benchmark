@@ -83,26 +83,97 @@ def simulate_temperature(C, S0, a, P_days, sigma, alpha_warm, alpha_cold, T0, k,
     }
 
 def calibrate_T0_k(observations, times_days, C, S0, a, P_days, sigma, alpha_warm, alpha_cold,
-                   T_init=288.0, dt_days=0.25, search_bounds=((265.0,285.0),(2.0,10.0))):
-    obs = np.asarray(observations)
-    t_obs = np.asarray(times_days)
+                   T_init=288.0, dt_days=0.25, search_bounds=((250.0, 290.0), (2.0, 20.0))):
+    obs = np.asarray(observations, dtype=float)
+    t_obs = np.asarray(times_days, dtype=float)
+
+    if obs.shape != t_obs.shape:
+        raise ValueError("observations and times_days must have the same shape.")
 
     (T0_lo, T0_hi), (k_lo, k_hi) = search_bounds
+
+    # Calibration uses a fixed Euler step for speed and determinism.
+    dt_cal = 0.5
+    dt_sec = dt_cal * 86400.0
+    P_sec = float(P_days) * 86400.0
+    n_days_needed = float(np.max(t_obs) + 10.0)
+    n_steps = int(math.ceil(n_days_needed / dt_cal))
+
+    t_series = np.arange(n_steps + 1, dtype=float) * dt_cal
+
+    def S_of_t_sec(t_sec):
+        return float(S0) * (1.0 + float(a) * math.cos(2.0 * math.pi * (t_sec / P_sec)))
+
+    def simulate_candidate(T0v, kv):
+        T = float(T_init)
+        T_out = np.zeros(n_steps + 1, dtype=float)
+        T_out[0] = T
+
+        for i in range(n_steps):
+            t_sec = (i * dt_cal) * 86400.0
+            S_t = S_of_t_sec(t_sec)
+
+            alpha = _alpha_of_T(T, alpha_warm, alpha_cold, float(T0v), float(kv))
+            incoming = (1.0 - alpha) * (S_t / 4.0)
+            outgoing = sigma * (T ** 4)
+            dTdt = (incoming - outgoing) / float(C)
+
+            T = T + dTdt * dt_sec
+
+            if not math.isfinite(T) or T <= 0:
+                return None
+
+            T_out[i + 1] = T
+
+        return T_out
+
+    def sse_for(T0v, kv):
+        T_out = simulate_candidate(T0v, kv)
+
+        if T_out is None:
+            return float("inf")
+
+        pred = np.interp(t_obs, t_series, T_out)
+        err = pred - obs
+        return float(np.sum(err * err))
+
+    # Stage 1: coarse deterministic grid search
+    T0_grid_1 = np.linspace(T0_lo, T0_hi, 13)
+    k_grid_1 = np.linspace(k_lo, k_hi, 13)
+
     best = (None, None, float("inf"))
 
-    T0_grid = np.linspace(T0_lo, T0_hi, 21)
-    k_grid  = np.linspace(k_lo,  k_hi,  21)
-
-    for T0v in T0_grid:
-        for kv in k_grid:
-            t_days, T = simulate_temperature_series(
-                C, S0, a, P_days, sigma, alpha_warm, alpha_cold,
-                T0v, kv, T_init, dt_days, max(times_days)+10
-            )
-            pred = np.interp(t_obs, t_days, T)
-            err = pred - obs
-            sse = float(np.sum(err*err))
+    for T0v in T0_grid_1:
+        for kv in k_grid_1:
+            sse = sse_for(float(T0v), float(kv))
             if sse < best[2]:
-                best = (float(T0v), float(kv), sse)
+                best = (float(T0v), float(kv), float(sse))
 
-    return {"T0_hat": best[0], "k_hat": best[1], "sse": best[2]}
+    # Stage 2: local refinement around the best coarse result
+    T0_c, k_c, _ = best
+
+    T0_grid_2 = np.linspace(
+        max(T0_lo, T0_c - 2.0),
+        min(T0_hi, T0_c + 2.0),
+        21
+    )
+
+    k_grid_2 = np.linspace(
+        max(k_lo, k_c - 2.0),
+        min(k_hi, k_c + 2.0),
+        21
+    )
+
+    best2 = best
+
+    for T0v in T0_grid_2:
+        for kv in k_grid_2:
+            sse = sse_for(float(T0v), float(kv))
+            if sse < best2[2]:
+                best2 = (float(T0v), float(kv), float(sse))
+
+    return {
+        "T0_hat": best2[0],
+        "k_hat": best2[1],
+        "sse": best2[2]
+    }
